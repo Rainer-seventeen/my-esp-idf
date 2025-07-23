@@ -16,11 +16,11 @@
 #define BUTTON_IO_NUM           9
 #define BUTTON_ACTIVE_LEVEL     0
 
-extern void example_ble_mesh_send_vendor_message(bool resend);
+extern  void example_ble_frnd_benchmark_trigger(void);
 
 static void button_tap_cb(void* arg)
 {
-    example_ble_mesh_send_vendor_message(false);
+    example_ble_frnd_benchmark_trigger();
 }
 
 static void board_button_init(void)
