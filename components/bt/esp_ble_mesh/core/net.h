@@ -20,10 +20,10 @@ extern "C" {
 #define BLE_MESH_NET_FLAG_KR        BIT(0)
 #define BLE_MESH_NET_FLAG_IVU       BIT(1)
 
-#define BLE_MESH_KR_NORMAL          0x00
-#define BLE_MESH_KR_PHASE_1         0x01
-#define BLE_MESH_KR_PHASE_2         0x02
-#define BLE_MESH_KR_PHASE_3         0x03
+#define BLE_MESH_KR_NORMAL          0x00    // 正常状态，使用旧密钥
+#define BLE_MESH_KR_PHASE_1         0x01    // 过渡状态，使用 old 发送，允许接受 new 和 old
+#define BLE_MESH_KR_PHASE_2         0x02    // 激活状态，使用 new 发送，允许接受 new 和 old
+#define BLE_MESH_KR_PHASE_3         0x03    // 结束状态，使用 new 发送，只允许接受 new
 
 #define BLE_MESH_IV_UPDATE(flags)   ((flags >> 1) & 0x01)
 #define BLE_MESH_KEY_REFRESH(flags) (flags & 0x01)
@@ -418,6 +418,7 @@ extern struct bt_mesh_net bt_mesh;
 
 #define BLE_MESH_NET_HDR_LEN        9
 
+// 宏定义函数拆解 PDU 的某几个位
 #define BLE_MESH_NET_HDR_IVI(pdu)   ((pdu)[0] >> 7)
 #define BLE_MESH_NET_HDR_NID(pdu)   ((pdu)[0] & 0x7F)
 #define BLE_MESH_NET_HDR_CTL(pdu)   ((pdu)[1] >> 7)
@@ -426,35 +427,53 @@ extern struct bt_mesh_net bt_mesh;
 #define BLE_MESH_NET_HDR_SRC(pdu)   (sys_get_be16(&(pdu)[5]))
 #define BLE_MESH_NET_HDR_DST(pdu)   (sys_get_be16(&(pdu)[7]))
 
+
+// unicast address 是 15 位，第一位永远是 0
 void bt_mesh_msg_cache_clear(uint16_t unicast_addr, uint8_t elem_num);
 
+// 更改一个子网 key 结构体 bt_mesh_subnet_keys
 int bt_mesh_net_keys_create(struct bt_mesh_subnet_keys *keys,
                             const uint8_t key[16]);
 
+/*  根据传入的 NetKey、NetKey 索引（NetIdx）、IV Index 和标志位，创建并初始化一个 BLE Mesh 子网（subnet）
+    并完成密钥派生、IV Index 设置、节点身份状态配置等初始化工作。*/
 int bt_mesh_net_create(uint16_t idx, uint8_t flags, const uint8_t key[16],
                        uint32_t iv_index);
 
+// 更新子网的flags，并返回当前的 flags
 uint8_t bt_mesh_net_flags(struct bt_mesh_subnet *sub);
 
+/*  key refresh 有三个阶段，1配置客户端发送新key，2节点收到后保存新key（此时旧key仍然可用），3用新key发送*/
+/*  bt_mesh_kr_update() 通过分析 Beacon 的 KR 标志和是否使用新密钥，
+    判断是否需要将本地子网的 Key Refresh 状态推进（进入 Phase 2 或回到 Normal），
+    并在必要时调用 bt_mesh_net_revoke_keys() 正式完成密钥切换。*/
 bool bt_mesh_kr_update(struct bt_mesh_subnet *sub, uint8_t new_kr, bool new_key);
 
+// 撤销子网的 OldKey，通常在 Key Refresh 过程中使用
 void bt_mesh_net_revoke_keys(struct bt_mesh_subnet *sub);
 
+/*  根据子网当前状态选择使用旧或新密钥，生成并更新 Secure Network Beacon 的认证值（Auth），
+    以保证 Mesh 网络中的 Beacon 广播具有认证和同步能力。*/
 int bt_mesh_net_secure_beacon_update(struct bt_mesh_subnet *sub);
+
 
 bool bt_mesh_net_iv_update(uint32_t iv_index, bool iv_update);
 
 void bt_mesh_net_sec_update(struct bt_mesh_subnet *sub);
 
+// 根据网络索引获取子网
 struct bt_mesh_subnet *bt_mesh_subnet_get(uint16_t net_idx);
 
+// 根据网络 ID、标志位、IV Index 和认证值查找子网
 struct bt_mesh_subnet *bt_mesh_subnet_find_with_snb(const uint8_t net_id[8], uint8_t flags,
                                                     uint32_t iv_index, const uint8_t auth[8],
                                                     bool *new_key);
 
+// 将网络层上层的数据打包为 Network PDU 并进行加密与混淆，准备通过 Bearer 层广播或转发。
 int bt_mesh_net_encode(struct bt_mesh_net_tx *tx, struct net_buf_simple *buf,
                        bool proxy);
 
+// spec P77
 int bt_mesh_net_send(struct bt_mesh_net_tx *tx, struct net_buf *buf,
                      const struct bt_mesh_send_cb *cb, void *cb_data);
 

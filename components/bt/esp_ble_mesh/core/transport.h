@@ -18,9 +18,10 @@ extern "C" {
 
 #define TRANS_SEQ_AUTH_NVAL             0xffffffffffffffff
 
-#define BLE_MESH_SDU_UNSEG_MAX          11
-#define BLE_MESH_CTL_SEG_SDU_MAX        8
-#define BLE_MESH_APP_SEG_SDU_MAX        12
+// 分包最大值
+#define BLE_MESH_SDU_UNSEG_MAX          11      // 总不超过 15，去掉 4 字节 MIC
+#define BLE_MESH_CTL_SEG_SDU_MAX        8       // Control
+#define BLE_MESH_APP_SEG_SDU_MAX        12      // Access
 #define BLE_MESH_TX_SDU_MAX             (CONFIG_BLE_MESH_TX_SEG_MAX * 12)
 
 #define TRANS_SEQ_ZERO_MASK             ((uint16_t)BIT_MASK(13))
@@ -113,6 +114,8 @@ void bt_mesh_tx_reset_single(uint16_t dst);
 int bt_mesh_ctl_send(struct bt_mesh_net_tx *tx, uint8_t ctl_op, void *data,
                      size_t data_len, const struct bt_mesh_send_cb *cb,
                      void *cb_data);
+
+/*发送端：Access消息的分包和重组 */
 
 int bt_mesh_trans_send(struct bt_mesh_net_tx *tx, struct net_buf_simple *msg,
                        const struct bt_mesh_send_cb *cb, void *cb_data);

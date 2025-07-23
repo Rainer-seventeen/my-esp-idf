@@ -41,6 +41,7 @@ _Static_assert(CONFIG_BLE_MESH_ADV_BUF_COUNT >= (CONFIG_BLE_MESH_TX_SEG_MAX + 3)
 
 #define AID_MASK                    ((uint8_t)(BIT_MASK(6)))
 
+// 获取 SEG AKF AID 等字段，这些适用于没有被分段的 PDU
 #define SEG(data)                   ((data)[0] >> 7)
 #define AKF(data)                   (((data)[0] >> 6) & 0x01)
 #define AID(data)                   ((data)[0] & AID_MASK)
@@ -508,6 +509,11 @@ static void seg_retransmit(struct k_work *work)
     seg_tx_send_unacked(tx);
 }
 
+/** @brief 发送一个分片 PDU
+ * 
+ * 是 Lower Transport 层对上层已加密好的 SDU（含 TransMIC）进行分片并通过广告广播发送的实现
+ * 
+ */
 static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
                     const struct bt_mesh_send_cb *cb, void *cb_data,
                     const uint8_t *ctl_op)
@@ -522,7 +528,8 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
     BT_DBG("src 0x%04x dst 0x%04x app_idx 0x%04x aszmic %u sdu_len %u",
            net_tx->src, net_tx->ctx->addr, net_tx->ctx->app_idx,
            net_tx->aszmic, sdu->len);
-
+    
+    // 寻找空闲的分片发送上下文
     for (tx = NULL, i = 0; i < ARRAY_SIZE(seg_tx); i++) {
         if (!seg_tx[i].nack_count &&
             /* In some critical conditions, the tx might be
@@ -543,6 +550,8 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
         return -EBUSY;
     }
 
+
+    // 构造 Segment Header
     if (ctl_op) {
         seg_hdr = TRANS_CTL_HDR(*ctl_op, 1);
     } else if (net_tx->ctx->app_idx == BLE_MESH_KEY_DEV) {
@@ -551,6 +560,7 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
         seg_hdr = SEG_HDR(1, net_tx->aid);
     }
 
+    // 构建会话状态参数
     tx->dst = net_tx->ctx->addr;
     if (sdu->len) {
         tx->seg_n = (sdu->len - 1) / seg_len(!!ctl_op);
@@ -560,14 +570,15 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
     tx->nack_count = tx->seg_n + 1;
     tx->seq_auth = SEQ_AUTH(BLE_MESH_NET_IVI_TX, bt_mesh.seq);
     tx->sub = net_tx->sub;
-    tx->new_key = net_tx->sub->kr_flag;
-    tx->attempts = SEG_RETRANSMIT_ATTEMPTS;
-    tx->seg_pending = 0;
+    tx->new_key = net_tx->sub->kr_flag;             // 标记是否在进行 Key Refresh
+    tx->attempts = SEG_RETRANSMIT_ATTEMPTS;         // 重传次数
+    tx->seg_pending = 0;                            
     tx->cred = net_tx->ctx->send_cred;
     tx->tag = net_tx->ctx->send_tag;
     tx->cb = cb;
     tx->cb_data = cb_data;
 
+    // TTL
     if (net_tx->ctx->send_ttl == BLE_MESH_TTL_DEFAULT) {
         tx->ttl = bt_mesh_default_ttl_get();
     } else {
@@ -578,6 +589,8 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
 
     BT_DBG("SeqZero 0x%04x", seq_zero);
 
+
+    // 如果目标是某个 LPN，且作为 Friend 缓存发送，就要提前确保 Friend Queue 有足够空间，否则取消本会话
     if (IS_ENABLED(CONFIG_BLE_MESH_FRIEND) &&
         !bt_mesh_friend_queue_has_space(tx->sub->net_idx, net_tx->src,
                                         tx->dst, &tx->seq_auth,
@@ -590,7 +603,7 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
     }
 
     bt_mesh_seg_tx_lock(tx);
-
+    // 循环生成并发送每一个分片
     for (seg_o = 0U; sdu->len; seg_o++) {
         struct net_buf *seg = NULL;
         uint16_t len = 0U;
@@ -604,6 +617,7 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
 
         net_buf_reserve(seg, BLE_MESH_NET_HDR_LEN);
 
+        // 写入相关分片 Header
         net_buf_add_u8(seg, seg_hdr);
         net_buf_add_u8(seg, (net_tx->aszmic << 7) | seq_zero >> 6);
         net_buf_add_u8(seg, (((seq_zero & 0x3f) << 2) | (seg_o >> 3)));
@@ -612,6 +626,7 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
         len = MIN(sdu->len, seg_len(!!ctl_op));
         net_buf_add_mem(seg, net_buf_simple_pull_mem(sdu, len), len);
 
+        // NOTE: Friend 相关操作
         if (IS_ENABLED(CONFIG_BLE_MESH_FRIEND)) {
             enum bt_mesh_friend_pdu_type type = BLE_MESH_FRIEND_PDU_PARTIAL;
 
@@ -673,6 +688,7 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
         send_cb_finalize(cb, cb_data);
     }
 
+    // 如果是 LPN 就发起一次 Poll 要求 Friend 
     if (IS_ENABLED(CONFIG_BLE_MESH_LOW_POWER) &&
         bt_mesh_lpn_established()) {
         bt_mesh_lpn_poll();
@@ -681,6 +697,17 @@ static int send_seg(struct bt_mesh_net_tx *net_tx, struct net_buf_simple *sdu,
     return 0;
 }
 
+
+/**
+ * @brief 发送一个 Access 数据
+ *
+ * @param tx 携带本次发送所需的上下文（子网、源地址、目的地址、AppKey 索引、发送标志等）
+ * @param msg 上层层待发送的明文 SDU，此时尚未加密、未带 MIC。
+ * @param cb 发送完成、超时等异步回调。
+ * @param cb_data 函数内部准备 key、aid、ad 等临时变量，用于后续取 Key、加密与虚拟地址处理。
+ *
+ * @return 0 成功 1 失败
+ */
 int bt_mesh_trans_send(struct bt_mesh_net_tx *tx, struct net_buf_simple *msg,
                        const struct bt_mesh_send_cb *cb, void *cb_data)
 {
@@ -694,6 +721,7 @@ int bt_mesh_trans_send(struct bt_mesh_net_tx *tx, struct net_buf_simple *msg,
         return -EINVAL;
     }
 
+    // 这里只是给 send_tag 打一个路由标志，实际数据尚未拆分
     if (msg->len > BLE_MESH_SDU_UNSEG_MAX) {
         tx->ctx->send_tag |= BLE_MESH_TAG_SEND_SEGMENTED;
     }
@@ -702,6 +730,8 @@ int bt_mesh_trans_send(struct bt_mesh_net_tx *tx, struct net_buf_simple *msg,
            tx->ctx->app_idx, tx->ctx->addr);
     BT_DBG("len %u: %s", msg->len, bt_hex(msg->data, msg->len));
 
+
+    // 获取上层 Key， 有可能是 Device Key，也可能是 AppKey
     err = bt_mesh_upper_key_get(tx->sub, tx->ctx->app_idx, &key,
                                 &aid, tx->ctx->addr);
     if (err) {
@@ -710,6 +740,8 @@ int bt_mesh_trans_send(struct bt_mesh_net_tx *tx, struct net_buf_simple *msg,
 
     tx->aid = aid;
 
+    // 确定 ASZMIC（应用消息的 MIC 长度）
+    // 只要最终走非分片，就必须短 MIC；分片且空间允许时可以用长 MIC
     if (!bt_mesh_tag_send_segmented(tx->ctx->send_tag) ||
         tx->ctx->send_szmic == BLE_MESH_SEG_SZMIC_SHORT ||
         net_buf_simple_tailroom(msg) < BLE_MESH_MIC_LONG) {
@@ -722,12 +754,14 @@ int bt_mesh_trans_send(struct bt_mesh_net_tx *tx, struct net_buf_simple *msg,
             bt_mesh_tag_send_segmented(tx->ctx->send_tag) ? "Seg" : "Unseg",
             tx->ctx->send_tag, tx->ctx->send_szmic, tx->aszmic);
 
+    // 如果是虚拟地址，则获取对应的 Label UUID
     if (BLE_MESH_ADDR_IS_VIRTUAL(tx->ctx->addr)) {
         ad = bt_mesh_label_uuid_get(tx->ctx->addr);
     } else {
         ad = NULL;
     }
-
+    
+    // 加密 SDU，生成加密后的 PDU
     err = bt_mesh_app_encrypt(key, tx->ctx->app_idx == BLE_MESH_KEY_DEV,
                               tx->aszmic, msg, ad, tx->src,
                               tx->ctx->addr, bt_mesh.seq,
@@ -737,6 +771,8 @@ int bt_mesh_trans_send(struct bt_mesh_net_tx *tx, struct net_buf_simple *msg,
         return err;
     }
 
+    // 如果是分包发送，则调用 send_seg() 发送分包消息
+    // 否则调用 send_unseg() 发送未分包消息
     if (bt_mesh_tag_send_segmented(tx->ctx->send_tag)) {
         return send_seg(tx, msg, cb, cb_data, NULL);
     }
@@ -1196,11 +1232,13 @@ static inline int32_t ack_timeout(struct seg_rx *rx)
 int bt_mesh_ctl_send(struct bt_mesh_net_tx *tx, uint8_t ctl_op, void *data,
                      size_t data_len, const struct bt_mesh_send_cb *cb,
                      void *cb_data)
-{
+{   
+    // 初始化缓冲区
     struct net_buf_simple buf = {0};
 
     net_buf_simple_init_with_data(&buf, data, data_len);
 
+    // 分片判断
     if (data_len > BLE_MESH_SDU_UNSEG_MAX) {
         tx->ctx->send_tag |= BLE_MESH_TAG_SEND_SEGMENTED;
     }
@@ -1442,6 +1480,13 @@ static struct seg_rx *seg_rx_alloc(struct bt_mesh_net_rx *net_rx,
     return NULL;
 }
 
+/**
+ * @brief 接收分段函数
+ * 
+ * 将一个分段的 mesh transport PDU（一个 segment）合并进接收缓存
+ * 判断是否接收完整，并最终将完整 Upper Transport PDU 上交给上层。
+ * 
+ */
 static int trans_seg(struct net_buf_simple *buf, struct bt_mesh_net_rx *net_rx,
                      enum bt_mesh_friend_pdu_type *pdu_type, uint64_t *seq_auth,
                      uint8_t *seg_count)
@@ -1454,11 +1499,13 @@ static int trans_seg(struct net_buf_simple *buf, struct bt_mesh_net_rx *net_rx,
     uint8_t seg_o = 0U;
     int err = 0;
 
+    // 前置 check
     if (buf->len < 5) {
         BT_ERR("Too short segmented message (len %u)", buf->len);
         return -EINVAL;
     }
 
+    // replay 重放检查，检查 seq 
     if (bt_mesh_rpl_check(net_rx, &rpl)) {
         BT_WARN("Replay: src 0x%04x dst 0x%04x seq 0x%06x",
                 net_rx->ctx.addr, net_rx->ctx.recv_dst, net_rx->seq);
@@ -1469,6 +1516,7 @@ static int trans_seg(struct net_buf_simple *buf, struct bt_mesh_net_rx *net_rx,
 
     net_buf_simple_pull(buf, 1);
 
+    /* 解析 Segment Header */
     seq_zero = net_buf_simple_pull_be16(buf);
     seg_o = (seq_zero & 0x03) << 3;
     seq_zero = (seq_zero >> 2) & TRANS_SEQ_ZERO_MASK;
@@ -1478,6 +1526,7 @@ static int trans_seg(struct net_buf_simple *buf, struct bt_mesh_net_rx *net_rx,
 
     BT_DBG("SeqZero 0x%04x SegO %u SegN %u", seq_zero, seg_o, seg_n);
 
+    // 当前的段数 > 总段数，error
     if (seg_o > seg_n) {
         BT_ERR("SegO greater than SegN (%u > %u)", seg_o, seg_n);
         return -EINVAL;
@@ -1496,13 +1545,15 @@ static int trans_seg(struct net_buf_simple *buf, struct bt_mesh_net_rx *net_rx,
      * Mentioned delta shall be >= 0, if it is not then seq_auth will
      * be broken and it will be verified by the code below.
      */
+    
+    // 计算 SeqAuth（用于判断是否是同一个 SDU）
     *seq_auth = SEQ_AUTH(BLE_MESH_NET_IVI_RX(net_rx),
                          (net_rx->seq -
                           ((((net_rx->seq & BIT_MASK(14)) - seq_zero)) & BIT_MASK(13))));
 
     *seg_count = seg_n + 1;
 
-    /* Look for old RX sessions */
+    /* Look for old RX sessions 查找已经存在的会话 */
     rx = seg_rx_find(net_rx, seq_auth);
     if (rx) {
         /* Discard old SeqAuth packet */
@@ -1590,6 +1641,7 @@ found_rx:
      * payload (for 64bit Net MIC) or 12 bytes of payload (for 32bit
      * Net MIC).
      */
+    // 检查 Segment 的长度
     if (seg_o == seg_n) {
         /* Set the expected final buffer length */
         rx->buf.len = seg_n * seg_len(rx->ctl) + buf->len;
@@ -1610,7 +1662,9 @@ found_rx:
             return -EINVAL;
         }
     }
-
+    /*  如果未建立 LPN Friendship，则需要在接收首段时启动一个 ACK 定时器；
+        超时后自动发出 Block Ack，告知发端哪些段已收到；
+        若已建立 Friendship，则由 Friend Node 管理 ACK。*/
     /* Reset the Incomplete Timer */
     rx->last = k_uptime_get_32();
 
@@ -1627,6 +1681,7 @@ found_rx:
     /* Mark segment as received */
     rx->block |= BIT(seg_o);
 
+    // 接收到的所有的 Segment
     if (rx->block != BLOCK_COMPLETE(seg_n)) {
         *pdu_type = BLE_MESH_FRIEND_PDU_PARTIAL;
         return 0;
@@ -1657,6 +1712,16 @@ found_rx:
     return err;
 }
 
+/**
+ * @brief 接收 Mesh Transport PDU
+ *
+ * 判断和处理接收到的 Transport 层 PDU，并在必要时进行重组、验证、缓存、上报等处理
+ *
+ * @param buf 接收的网络层数据，包含 Lower Transport 层数据（包括 segment 或 unsegmented frame）
+ * @param rx 网络层提供的上下文信息，例如源地址、目标地址、NetKey 索引、Friend 相关等
+ *
+ * @return 0 on success, or a negative error code on failure.
+ */
 int bt_mesh_trans_recv(struct net_buf_simple *buf, struct bt_mesh_net_rx *rx)
 {
     uint64_t seq_auth = TRANS_SEQ_AUTH_NVAL;
@@ -1665,7 +1730,9 @@ int bt_mesh_trans_recv(struct net_buf_simple *buf, struct bt_mesh_net_rx *rx)
     uint8_t seg_count = 0U;
     int err = 0;
 
+    // 判断是否是为某一个 LPN 服务的 Friend 状态
     if (IS_ENABLED(CONFIG_BLE_MESH_FRIEND)) {
+        // 尝试匹配 Friend
         rx->friend_match = bt_mesh_friend_match(rx->sub->net_idx,
                                                 rx->ctx.recv_dst);
     } else {
@@ -1675,7 +1742,7 @@ int bt_mesh_trans_recv(struct net_buf_simple *buf, struct bt_mesh_net_rx *rx)
     BT_DBG("src 0x%04x dst 0x%04x seq 0x%08x friend_match %u",
            rx->ctx.addr, rx->ctx.recv_dst, rx->seq, rx->friend_match);
 
-    /* Remove network headers */
+    /* 去除 Network 层首部，得到 Lower Transport PDU */
     net_buf_simple_pull(buf, BLE_MESH_NET_HDR_LEN);
 
     BT_DBG("Payload %s", bt_hex(buf->data, buf->len));
@@ -1684,6 +1751,7 @@ int bt_mesh_trans_recv(struct net_buf_simple *buf, struct bt_mesh_net_rx *rx)
      * requested the Friend to send them. The messages must also
      * be encrypted using the Friend Credentials.
      */
+    // NOTE: LPN 相关
     if (IS_ENABLED(CONFIG_BLE_MESH_LOW_POWER) &&
         bt_mesh_lpn_established() && rx->net_if == BLE_MESH_NET_IF_ADV &&
         (!bt_mesh_lpn_waiting_update() ||
@@ -1697,6 +1765,7 @@ int bt_mesh_trans_recv(struct net_buf_simple *buf, struct bt_mesh_net_rx *rx)
      */
     net_buf_simple_save(buf, &state);
 
+    // 分片判断
     if (SEG(buf->data)) {
         /* Segmented messages must match a local element or an
          * LPN of this Friend.
@@ -1711,6 +1780,7 @@ int bt_mesh_trans_recv(struct net_buf_simple *buf, struct bt_mesh_net_rx *rx)
         err = trans_unseg(buf, rx, &seq_auth);
     }
 
+    /*NOTE: 下文是关于 Friend 相关的操作*/
     /* Notify LPN state machine so a Friend Poll will be sent. If the
      * message was a Friend Update it's possible that a Poll was already
      * queued for sending, however that's fine since then the

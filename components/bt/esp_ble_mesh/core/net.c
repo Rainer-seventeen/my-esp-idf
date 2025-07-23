@@ -88,6 +88,7 @@ static int dup_cache_next;
 #define BLE_MESH_MAX_STORED_RELAY_COUNT  (CONFIG_BLE_MESH_RELAY_ADV_BUF_COUNT / 2)
 #endif
 
+// 检查缓冲区判断是否重复出现
 static bool check_dup(struct net_buf_simple *data)
 {
     const uint8_t *tail = net_buf_simple_tail(data);
@@ -108,6 +109,7 @@ static bool check_dup(struct net_buf_simple *data)
     return false;
 }
 
+// Spec P74
 static bool msg_cache_match(struct bt_mesh_net_rx *rx,
                             struct net_buf_simple *pdu)
 {
@@ -547,6 +549,7 @@ void bt_mesh_net_revoke_keys(struct bt_mesh_subnet *sub)
 
     BT_DBG("idx 0x%04x", sub->net_idx);
 
+    // keys[0] 是当前使用密钥槽（旧的）keys[1] 是 Key Refresh 时设置的新密钥槽
     memcpy(&sub->keys[0], &sub->keys[1], sizeof(sub->keys[0]));
 
     if (IS_ENABLED(CONFIG_BLE_MESH_SETTINGS)) {
@@ -554,6 +557,7 @@ void bt_mesh_net_revoke_keys(struct bt_mesh_subnet *sub)
         bt_mesh_store_subnet(sub);
     }
 
+    // 遍历所有的 AppKey，更新它们的密钥
     for (i = 0; i < ARRAY_SIZE(bt_mesh.app_keys); i++) {
         struct bt_mesh_app_key *key = &bt_mesh.app_keys[i];
 
@@ -574,6 +578,7 @@ void bt_mesh_net_revoke_keys(struct bt_mesh_subnet *sub)
 bool bt_mesh_kr_update(struct bt_mesh_subnet *sub, uint8_t new_kr, bool new_key)
 {
     if (new_kr != sub->kr_flag && sub->kr_phase == BLE_MESH_KR_NORMAL) {
+          // 网络状态不一致
         BT_WARN("KR change in normal operation. Are we blacklisted?");
         return false;
     }
@@ -582,6 +587,7 @@ bool bt_mesh_kr_update(struct bt_mesh_subnet *sub, uint8_t new_kr, bool new_key)
 
     if (sub->kr_flag) {
         if (sub->kr_phase == BLE_MESH_KR_PHASE_1) {
+            // 从1切换到 Phase 2
             BT_INFO("Phase 1 -> Phase 2");
             sub->kr_phase = BLE_MESH_KR_PHASE_2;
 
@@ -593,6 +599,7 @@ bool bt_mesh_kr_update(struct bt_mesh_subnet *sub, uint8_t new_kr, bool new_key)
             return true;
         }
     } else {
+        // KR == 0 表示应该结束 refresh
         switch (sub->kr_phase) {
         case BLE_MESH_KR_PHASE_1:
             if (!new_key) {
@@ -957,6 +964,7 @@ int bt_mesh_net_encode(struct bt_mesh_net_tx *tx, struct net_buf_simple *buf,
     uint8_t nid = 0U;
     int err = 0;
 
+    // 检查 MIC 空间是否足够
     if (ctl && net_buf_simple_tailroom(buf) < BLE_MESH_MIC_LONG) {
         BT_ERR("Insufficient MIC space for CTL PDU");
         return -EINVAL;
@@ -970,19 +978,24 @@ int bt_mesh_net_encode(struct bt_mesh_net_tx *tx, struct net_buf_simple *buf,
     BT_DBG("src 0x%04x dst 0x%04x ctl %u seq 0x%06x",
            tx->src, tx->ctx->addr, ctl, bt_mesh.seq);
 
-    net_buf_simple_push_be16(buf, tx->ctx->addr);
-    net_buf_simple_push_be16(buf, tx->src);
+    // 构建 PDU
+    net_buf_simple_push_be16(buf, tx->ctx->addr);   // 目的地址
+    net_buf_simple_push_be16(buf, tx->src);         // 源地址
 
-    net_buf_simple_push_be24(buf, bt_mesh_next_seq());
+    net_buf_simple_push_be24(buf, bt_mesh_next_seq());  // 序列号
 
+    // TTL 和 CTL 设置
     if (ctl) {
+        // CTL == 0 表示 Access Message
         net_buf_simple_push_u8(buf, tx->ctx->send_ttl | 0x80);
     } else {
+        // CTL == 1 表示 Transport Control Message
         net_buf_simple_push_u8(buf, tx->ctx->send_ttl);
     }
 
     BT_INFO("Use security credentials 0x%02x, proxy %d", tx->ctx->send_cred, proxy);
 
+    /* 选择密钥 */
     if (IS_ENABLED(CONFIG_BLE_MESH_LOW_POWER) &&
         tx->ctx->send_cred == BLE_MESH_FRIENDSHIP_CRED) {
         err = friend_cred_get(tx->sub, BLE_MESH_ADDR_UNASSIGNED,
@@ -1019,14 +1032,14 @@ int bt_mesh_net_encode(struct bt_mesh_net_tx *tx, struct net_buf_simple *buf,
         priv = tx->sub->keys[tx->sub->kr_flag].privacy;
     }
 
-    net_buf_simple_push_u8(buf, (nid | (BLE_MESH_NET_IVI_TX & 1) << 7));
+    net_buf_simple_push_u8(buf, (nid | (BLE_MESH_NET_IVI_TX & 1) << 7));    // NID 和 IVI
 
-    err = bt_mesh_net_encrypt(enc, buf, BLE_MESH_NET_IVI_TX, proxy, false);
+    err = bt_mesh_net_encrypt(enc, buf, BLE_MESH_NET_IVI_TX, proxy, false); // 加密 PDU
     if (err) {
         return err;
     }
 
-    return bt_mesh_net_obfuscate(buf->data, BLE_MESH_NET_IVI_TX, priv);
+    return bt_mesh_net_obfuscate(buf->data, BLE_MESH_NET_IVI_TX, priv);     // 混淆 PDU
 }
 
 #if !CONFIG_BLE_MESH_V11_SUPPORT
@@ -1058,7 +1071,9 @@ static void bt_mesh_net_adv_xmit_update(struct bt_mesh_net_tx *tx)
 
 int bt_mesh_net_send(struct bt_mesh_net_tx *tx, struct net_buf *buf,
                      const struct bt_mesh_send_cb *cb, void *cb_data)
-{
+{   
+    // 具体可以观看 Spec P77
+    // cb 是 回调函数结构体，内部包含两个函数指针
     const struct bt_mesh_send_cb *send_cb = cb;
     uint8_t bearer = BLE_MESH_ALL_BEARERS;
     int err = 0;
@@ -1068,7 +1083,8 @@ int bt_mesh_net_send(struct bt_mesh_net_tx *tx, struct net_buf *buf,
            net_buf_tailroom(buf));
     BT_DBG("Payload len %u: %s", buf->len, bt_hex(buf->data, buf->len));
     BT_DBG("Seq 0x%06x", bt_mesh.seq);
-
+    
+    // 修正 TTL 
     if (tx->ctx->send_ttl == BLE_MESH_TTL_DEFAULT) {
         tx->ctx->send_ttl = bt_mesh_default_ttl_get();
     }
@@ -1102,7 +1118,8 @@ int bt_mesh_net_send(struct bt_mesh_net_tx *tx, struct net_buf *buf,
 #if CONFIG_BLE_MESH_DF_SRV
     bt_mesh_update_net_send_cred(tx, &bearer);
 #endif /* CONFIG_BLE_MESH_DF_SRV */
-
+    
+    // 把 上层 Transport PDU 编码成为 NetWork PDU
     err = bt_mesh_net_encode(tx, &buf->b, false);
     if (err) {
         goto done;
@@ -1933,16 +1950,18 @@ void bt_mesh_generic_net_recv(struct net_buf_simple *data,
         return;
     }
 
+    // 尝试解码
     if (bt_mesh_net_decode(data, net_if, rx, &buf)) {
         return;
     }
 
+    // 尝试判断是否需要忽略
     if (ignore_net_msg(rx->ctx.addr, rx->ctx.recv_dst)) {
         return;
     }
 
     /* Save the state so the buffer can later be relayed */
-    net_buf_simple_save(&buf, &state);
+    net_buf_simple_save(&buf, &state);  // 日后用于转发功能
 
     BT_BQB(BLE_MESH_BQB_TEST_LOG_LEVEL_PRIMARY_ID_NODE | \
            BLE_MESH_BQB_TEST_LOG_LEVEL_SUB_ID_NET,
@@ -1954,6 +1973,8 @@ void bt_mesh_generic_net_recv(struct net_buf_simple *data,
      * we need to make sure the directed forwarding functionality is enabled in the
      * corresponding subnet.
      */
+
+     // 匹配本地地址
     rx->local_match = (bt_mesh_fixed_group_match(rx->ctx.recv_dst) ||
                       bt_mesh_fixed_direct_match(rx->sub, rx->ctx.recv_dst) ||
                       bt_mesh_elem_find(rx->ctx.recv_dst));
@@ -2005,6 +2026,7 @@ void bt_mesh_generic_net_recv(struct net_buf_simple *data,
     /* Relay if this was a group/virtual address, or if the destination
      * was neither a local element nor an LPN we're Friends for.
      */
+    // 中继操作 Relay   
     if (!BLE_MESH_ADDR_IS_UNICAST(rx->ctx.recv_dst) ||
         (!rx->local_match && !rx->friend_match
 #if CONFIG_BLE_MESH_NOT_RELAY_REPLAY_MSG
@@ -2044,6 +2066,7 @@ static void ivu_refresh(struct k_work *work)
 
 void bt_mesh_net_start(void)
 {
+    // secure beacon 安全信标
     if (bt_mesh_secure_beacon_get() == BLE_MESH_SECURE_BEACON_ENABLED) {
         bt_mesh_secure_beacon_enable();
     } else {
@@ -2058,6 +2081,7 @@ void bt_mesh_net_start(void)
     }
 #endif
 
+    // GATT Proxy Server
     if (IS_ENABLED(CONFIG_BLE_MESH_GATT_PROXY_SERVER) &&
         bt_mesh_gatt_proxy_get() != BLE_MESH_GATT_PROXY_NOT_SUPPORTED) {
         bt_mesh_proxy_server_gatt_enable();
