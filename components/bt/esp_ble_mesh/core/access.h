@@ -22,6 +22,7 @@ enum {
     BLE_MESH_MOD_PUB_PENDING = BIT(2),
 };
 
+// 元素element 和 模型 model 注册
 void bt_mesh_elem_register(struct bt_mesh_elem *elem, uint8_t count);
 
 uint8_t bt_mesh_elem_count(void);
@@ -31,6 +32,7 @@ struct bt_mesh_elem *bt_mesh_elem_find(uint16_t addr);
 
 uint16_t *bt_mesh_model_find_group(struct bt_mesh_model *mod, uint16_t addr);
 
+// optcode 解析
 int bt_mesh_get_opcode(struct net_buf_simple *buf,
                        uint32_t *opcode, bool pull_buf);
 
@@ -44,6 +46,7 @@ void bt_mesh_model_foreach(void (*func)(struct bt_mesh_model *mod,
                                         void *user_data),
                            void *user_data);
 
+// 模型周期发布
 int32_t bt_mesh_model_pub_period_get(struct bt_mesh_model *mod);
 
 void bt_mesh_comp_provision(uint16_t addr);
