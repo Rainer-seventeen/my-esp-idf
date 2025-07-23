@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdbool.h>
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -44,9 +45,13 @@
 static uint8_t dev_uuid[ESP_BLE_MESH_OCTET16_LEN];
 
 /* 定义用于筛选 lpn addr */
-#define MAX_LPN_NODES 3
-static uint16_t lpn_addr[MAX_LPN_NODES] = { 0 };
+#define ESP_BLE_MESH_MAX_LPN_NODES 3
+static uint16_t lpn_addr[ESP_BLE_MESH_MAX_LPN_NODES] = { 0 };
 static int lpn_addr_count = 0;
+
+/* 测试相关*/
+static esp_timer_handle_t periodic_timer;
+static bool is_triggered = false;   // 是否处于发送状态
 
 static struct example_info_store {
     uint16_t server_addr;   /* Vendor server unicast address */
@@ -172,8 +177,8 @@ static esp_err_t prov_complete(uint16_t node_index, const esp_ble_mesh_octet16_t
 
     store.server_addr = primary_addr;
 
-    // 将数据存储进 flash
-    mesh_example_info_store(); /* Store proper mesh example info */
+    // 将数据存储进 flash, 这里关闭存储
+    // mesh_example_info_store(); /* Store proper mesh example info */
 
     sprintf(name, "%s%02x", "NODE-", node_index);
     err = esp_ble_mesh_provisioner_set_node_name(node_index, name);
@@ -318,8 +323,12 @@ static void example_ble_mesh_parse_node_comp_data(const uint8_t *data, uint16_t 
 
     /* 将 lpn addr 存储进数组 */
     if (feat & ESP_BLE_MESH_FEATURE_LOW_POWER){
-        lpn_addr[lpn_addr_count++] = addr;
-        ESP_LOGI(TAG, "Detected LPN node at 0x%04x (total %d)", addr, lpn_addr_count);
+        if (lpn_addr_count < ESP_BLE_MESH_MAX_LPN_NODES) {
+            lpn_addr[lpn_addr_count++] = addr;
+            ESP_LOGI(TAG, "LPN Address stored, addr: 0x%04x (total %d)", addr, lpn_addr_count);
+        } else {
+            ESP_LOGW(TAG, "LPN address array is full, fail to store");
+        }
     }
 
 
@@ -470,7 +479,11 @@ void example_ble_mesh_send_vendor_message(bool resend)
 
     ctx.net_idx = prov_key.net_idx;
     ctx.app_idx = prov_key.app_idx;
-    ctx.addr = lpn_addr[0];    // 修改为向第一个 lpn 发送数据
+    ctx.addr = lpn_addr[0];
+    if (lpn_addr_count > 0) {
+        // ESP_LOGI(TAG, "##LPN Address Count%d" ,lpn_addr_count);
+        ctx.addr = lpn_addr[lpn_addr_count - 1];    // 向最新的一个 lpn 发送数据
+    }
     ctx.send_ttl = MSG_SEND_TTL;
     opcode = ESP_BLE_MESH_VND_MODEL_OP_SEND;
 
@@ -478,14 +491,16 @@ void example_ble_mesh_send_vendor_message(bool resend)
         store.vnd_tid++;
     }
 
+    // 这里修改成  response 
     err = esp_ble_mesh_client_model_send_msg(vendor_client.model, &ctx, opcode,
-            sizeof(store.vnd_tid), (uint8_t *)&store.vnd_tid, MSG_TIMEOUT, true, MSG_ROLE);
+            sizeof(store.vnd_tid), (uint8_t *)&store.vnd_tid, MSG_TIMEOUT, false, MSG_ROLE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to send vendor message 0x%06" PRIx32, opcode);
         return;
     }
 
-    mesh_example_info_store(); /* Store proper mesh example info */
+    // 关闭存储功能
+    // mesh_example_info_store(); /* Store proper mesh example info */
 }
 
 static void example_ble_mesh_custom_model_cb(esp_ble_mesh_model_cb_event_t event,
@@ -507,14 +522,15 @@ static void example_ble_mesh_custom_model_cb(esp_ble_mesh_model_cb_event_t event
             break;
         }
         start_time = esp_timer_get_time();
-        ESP_LOGI(TAG, "Send 0x%06" PRIx32, param->model_send_comp.opcode);
+        ESP_LOGI(TAG, "Send 0x%06" PRIx32 ", tid: 0x%04x", param->model_send_comp.opcode, store.vnd_tid);
         break;
     case ESP_BLE_MESH_CLIENT_MODEL_RECV_PUBLISH_MSG_EVT:
         ESP_LOGI(TAG, "Receive publish message 0x%06" PRIx32, param->client_recv_publish_msg.opcode);
         break;
     case ESP_BLE_MESH_CLIENT_MODEL_SEND_TIMEOUT_EVT:
-        ESP_LOGW(TAG, "Client message 0x%06" PRIx32 " timeout", param->client_send_timeout.opcode);
-        example_ble_mesh_send_vendor_message(true);
+            /* 关闭重新发送 */
+        // ESP_LOGW(TAG, "Client message 0x%06" PRIx32 " timeout", param->client_send_timeout.opcode);
+        // example_ble_mesh_send_vendor_message(true);
         break;
     default:
         break;
@@ -569,6 +585,28 @@ static esp_err_t ble_mesh_init(void)
     return ESP_OK;
 }
 
+// 定时器回调
+static void example_ble_send_vendor_model_cb(void* arg)
+{
+    example_ble_mesh_send_vendor_message(false);
+}
+
+// 开启或者关闭测试计时器
+void example_ble_frnd_benchmark_trigger(void)
+{
+    if (!is_triggered) {
+        is_triggered = true;
+        // 周期 1,000,000 µs = 1s
+        esp_timer_start_periodic(periodic_timer, 1000000);
+        ESP_LOGI(TAG, "Send Timer set, Benchmark Start");
+    } else {
+        is_triggered = false;
+        esp_timer_stop(periodic_timer);
+        ESP_LOGI(TAG, "Send Timer off, Benchmark stop");
+    }
+}
+
+
 void app_main(void)
 {
     esp_err_t err;
@@ -603,4 +641,16 @@ void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Bluetooth mesh init failed (err %d)", err);
     }
+
+    /* 初始化计时器 */
+    const esp_timer_create_args_t timer_args = {
+        .callback = &example_ble_send_vendor_model_cb,
+        .arg      = NULL,
+        .name     = "frnd_benchmark"
+    };
+    err = esp_timer_create(&timer_args, &periodic_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Send timer init failed (err %d)", err);
+    }
+    
 }
