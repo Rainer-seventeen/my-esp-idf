@@ -110,3 +110,5 @@ XUNIT_RESULT*.xml
 
 # Vale
 .vale/styles/*
+
+/components/esp_wifi/lib
